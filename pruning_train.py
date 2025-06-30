@@ -1,372 +1,448 @@
-# https://github.com/pytorch/vision/blob/master/torchvision/models/__init__.py
+from __future__ import division
+import os, sys, shutil, time, random
 import argparse
-import os, sys
-import shutil
-import time
-
 import torch
-import torch.nn as nn
-import torch.nn.parallel
 import torch.backends.cudnn as cudnn
-import torch.optim
-import torch.utils.data
+import torchvision.datasets as dset
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import torchvision.models
-from utils import convert_secs2time, time_string, time_file_str
-# from models import print_log
+from utils import AverageMeter, RecorderMeter, time_string, convert_secs2time
 import models
-import random
-import numpy as np
-from collections import OrderedDict
+import copy
+from pruning_utils import get_filter_importance, distillation_loss, update_bn_stats, collect_activation_stats
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
 
-parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
-                    help='path to dataset')
-parser.add_argument('--save_dir', type=str, default='./', help='Folder to save checkpoints and log.')
-parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18',
-                    choices=model_names,
-                    help='model architecture: ' +
-                         ' | '.join(model_names) +
-                         ' (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                    help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int, metavar='N', help='mini-batch size (default: 256)')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR', help='initial learning rate')
-parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='momentum')
-parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float, metavar='W',
-                    help='weight decay (default: 1e-4)')
-parser.add_argument('--print-freq', '-p', default=200, type=int, metavar='N', help='print frequency (default: 100)')
+parser = argparse.ArgumentParser(description='Trains ResNeXt on CIFAR or ImageNet',
+                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('data_path', type=str, help='Path to dataset')
+parser.add_argument('--dataset', type=str, choices=['cifar10', 'cifar100', 'imagenet', 'svhn', 'stl10'],
+                    help='Choose between Cifar10/100 and ImageNet.')
+parser.add_argument('--arch', metavar='ARCH', default='resnet18', choices=model_names,
+                    help='model architecture: ' + ' | '.join(model_names) + ' (default: resnext29_8_64)')
+# Optimization options
+parser.add_argument('--epochs', type=int, default=300, help='Number of epochs to train.')
+parser.add_argument('--batch_size', type=int, default=128, help='Batch size.')
+parser.add_argument('--learning_rate', type=float, default=0.1, help='The Learning Rate.')
+parser.add_argument('--momentum', type=float, default=0.9, help='Momentum.')
+parser.add_argument('--decay', type=float, default=0.0005, help='Weight decay (L2 penalty).')
+parser.add_argument('--schedule', type=int, nargs='+', default=[150, 225],
+                    help='Decrease learning rate at these epochs.')
+parser.add_argument('--gammas', type=float, nargs='+', default=[0.1, 0.1],
+                    help='LR is multiplied by gamma on schedule, number of gammas should be equal to schedule')
+# Checkpoints
+parser.add_argument('--print_freq', default=200, type=int, metavar='N', help='print frequency (default: 200)')
+parser.add_argument('--save_path', type=str, default='./', help='Folder to save checkpoints and log.')
 parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
-parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
-parser.add_argument('--use_pretrain', dest='use_pretrain', action='store_true', help='use pre-trained model or not')
+parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
+parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
+# Acceleration
+parser.add_argument('--ngpu', type=int, default=1, help='0 = CPU.')
+parser.add_argument('--workers', type=int, default=2, help='number of data loading workers (default: 2)')
+# random seed
+parser.add_argument('--manualSeed', type=int, help='manual seed')
 # compress rate
 parser.add_argument('--rate', type=float, default=0.9, help='compress rate of model')
-parser.add_argument('--layer_begin', type=int, default=3, help='compress layer of model')
-parser.add_argument('--layer_end', type=int, default=3, help='compress layer of model')
+parser.add_argument('--layer_begin', type=int, default=1, help='compress layer of model')
+parser.add_argument('--layer_end', type=int, default=1, help='compress layer of model')
 parser.add_argument('--layer_inter', type=int, default=1, help='compress layer of model')
 parser.add_argument('--epoch_prune', type=int, default=1, help='compress layer of model')
-parser.add_argument('--skip_downsample', type=int, default=1, help='compress layer of model')
-parser.add_argument('--use_sparse', dest='use_sparse', action='store_true', help='use sparse model as initial or not')
-parser.add_argument('--sparse',
-                    default='/data/yahe/imagenet/resnet50-rate-0.7/checkpoint.resnet50.2018-01-07-9744.pth.tar',
-                    type=str, metavar='PATH', help='path of sparse model')
-parser.add_argument('--lr_adjust', type=int, default=30, help='number of epochs that change learning rate')
+parser.add_argument('--use_state_dict', dest='use_state_dict', action='store_true', help='use state dcit or not')
+parser.add_argument('--use_pretrain', dest='use_pretrain', action='store_true', help='use pre-trained model or not')
+parser.add_argument('--pretrain_path', default='', type=str, help='..path of pre-trained model')
 
+# Added optimization arguments
+parser.add_argument('--use_adaptive_rate', action='store_true', help='Use adaptive pruning rates based on layer position')
+parser.add_argument('--use_progressive_pruning', action='store_true', help='Use progressive pruning schedule')
+parser.add_argument('--use_cosine_lr', action='store_true', help='Use cosine annealing learning rate scheduler')
+parser.add_argument('--use_distillation', action='store_true', help='Use knowledge distillation during pruning')
+parser.add_argument('--use_activation_stats', action='store_true', help='Use activation statistics for pruning')
+parser.add_argument('--distill_temp', type=float, default=3.0, help='Temperature for knowledge distillation')
+parser.add_argument('--warmup_epochs', type=int, default=5, help='Number of warmup epochs before pruning')
+parser.add_argument('--distill_alpha', type=float, default=0.5, help='Weight for distillation loss')
 
 args = parser.parse_args()
-args.use_cuda = torch.cuda.is_available()
+args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
 
-args.prefix = time_file_str()
+if args.manualSeed is None:
+    args.manualSeed = random.randint(1, 10000)
+random.seed(args.manualSeed)
+torch.manual_seed(args.manualSeed)
+if args.use_cuda:
+    torch.cuda.manual_seed_all(args.manualSeed)
+cudnn.benchmark = True
 
 
 def main():
-    best_prec1 = 0
-
-    if not os.path.isdir(args.save_dir):
-        os.makedirs(args.save_dir)
-    log = open(os.path.join(args.save_dir, '{}.{}.log'.format(args.arch, args.prefix)), 'w')
-
-    # version information
-    print_log("PyThon  version : {}".format(sys.version.replace('\n', ' ')), log)
-    print_log("PyTorch version : {}".format(torch.__version__), log)
-    print_log("cuDNN   version : {}".format(torch.backends.cudnn.version()), log)
-    print_log("Vision  version : {}".format(torchvision.__version__), log)
-    # create model
-    print_log("=> creating model '{}'".format(args.arch), log)
-    model = models.__dict__[args.arch](pretrained=True)
-    if args.use_sparse:
-        model = import_sparse(model)
-    print_log("=> Model : {}".format(model), log)
-    print_log("=> parameter : {}".format(args), log)
+    # Init logger
+    if not os.path.isdir(args.save_path):
+        os.makedirs(args.save_path)
+    log = open(os.path.join(args.save_path, 'log_seed_{}.txt'.format(args.manualSeed)), 'w')
+    print_log('save path : {}'.format(args.save_path), log)
+    state = {k: v for k, v in args._get_kwargs()}
+    print_log(state, log)
+    print_log("Random Seed: {}".format(args.manualSeed), log)
+    print_log("python version : {}".format(sys.version.replace('\n', ' ')), log)
+    print_log("torch version : {}".format(torch.__version__), log)
+    print_log("cudnn version : {}".format(torch.backends.cudnn.version()), log)
     print_log("Compress Rate: {}".format(args.rate), log)
     print_log("Layer Begin: {}".format(args.layer_begin), log)
     print_log("Layer End: {}".format(args.layer_end), log)
     print_log("Layer Inter: {}".format(args.layer_inter), log)
     print_log("Epoch prune: {}".format(args.epoch_prune), log)
-    print_log("Skip downsample : {}".format(args.skip_downsample), log)
-    print_log("Workers         : {}".format(args.workers), log)
-    print_log("Learning-Rate   : {}".format(args.lr), log)
-    print_log("Use Pre-Trained : {}".format(args.use_pretrain), log)
-    print_log("lr adjust : {}".format(args.lr_adjust), log)
+    
+    # Print optimization settings
+    if args.use_adaptive_rate:
+        print_log("Using adaptive pruning rates", log)
+    if args.use_progressive_pruning:
+        print_log("Using progressive pruning schedule with warmup epochs: {}".format(args.warmup_epochs), log)
+    if args.use_cosine_lr:
+        print_log("Using cosine annealing learning rate scheduler", log)
+    if args.use_distillation:
+        print_log("Using knowledge distillation with temperature: {}".format(args.distill_temp), log)
+    if args.use_activation_stats:
+        print_log("Using activation statistics for pruning", log)
 
-    if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
-        model.features = torch.nn.DataParallel(model.features)
-        model.cuda()
+    # Init dataset
+    if not os.path.isdir(args.data_path):
+        os.makedirs(args.data_path)
+
+    if args.dataset == 'cifar10':
+        mean = [x / 255 for x in [125.3, 123.0, 113.9]]
+        std = [x / 255 for x in [63.0, 62.1, 66.7]]
+    elif args.dataset == 'cifar100':
+        mean = [x / 255 for x in [129.3, 124.1, 112.4]]
+        std = [x / 255 for x in [68.2, 65.4, 70.4]]
     else:
-        model = torch.nn.DataParallel(model).cuda()
+        assert False, "Unknow dataset : {}".format(args.dataset)
+
+    # Enhanced data augmentation for better generalization
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),  # Added color jitter
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+    
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+
+    if args.dataset == 'cifar10':
+        train_data = dset.CIFAR10(args.data_path, train=True, transform=train_transform, download=True)
+        test_data = dset.CIFAR10(args.data_path, train=False, transform=test_transform, download=True)
+        num_classes = 10
+    elif args.dataset == 'cifar100':
+        train_data = dset.CIFAR100(args.data_path, train=True, transform=train_transform, download=True)
+        test_data = dset.CIFAR100(args.data_path, train=False, transform=test_transform, download=True)
+        num_classes = 100
+    elif args.dataset == 'svhn':
+        train_data = dset.SVHN(args.data_path, split='train', transform=train_transform, download=True)
+        test_data = dset.SVHN(args.data_path, split='test', transform=test_transform, download=True)
+        num_classes = 10
+    elif args.dataset == 'stl10':
+        train_data = dset.STL10(args.data_path, split='train', transform=train_transform, download=True)
+        test_data = dset.STL10(args.data_path, split='test', transform=test_transform, download=True)
+        num_classes = 10
+    elif args.dataset == 'imagenet':
+        assert False, 'Do not finish imagenet code'
+    else:
+        assert False, 'Do not support dataset : {}'.format(args.dataset)
+
+    # Optimized data loading with proper worker configuration
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
+                                               num_workers=args.workers, pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
+                                              num_workers=args.workers, pin_memory=True)
+
+    print_log("=> creating model '{}'".format(args.arch), log)
+    # Init model, criterion, and optimizer
+    net = models.__dict__[args.arch](num_classes)
+    print_log("=> network :\n {}".format(net), log)
+
+    net = torch.nn.DataParallel(net, device_ids=list(range(args.ngpu)))
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = torch.nn.CrossEntropyLoss()
+    
+    # Use SGD with Nesterov momentum for better convergence
+    optimizer = torch.optim.SGD(net.parameters(), state['learning_rate'], momentum=state['momentum'],
+                                weight_decay=state['decay'], nesterov=True)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay,
-                                nesterov=True)
+    if args.use_cuda:
+        net.cuda()
+        criterion.cuda()
 
+    recorder = RecorderMeter(args.epochs)
+    
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
             print_log("=> loading checkpoint '{}'".format(args.resume), log)
             checkpoint = torch.load(args.resume)
+            recorder = checkpoint['recorder']
             args.start_epoch = checkpoint['epoch']
-            best_prec1 = checkpoint['best_prec1']
-            model.load_state_dict(checkpoint['state_dict'])
+            if args.use_state_dict:
+                net.load_state_dict(checkpoint['state_dict'])
+            else:
+                net = checkpoint['state_dict']
+
             optimizer.load_state_dict(checkpoint['optimizer'])
             print_log("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']), log)
         else:
             print_log("=> no checkpoint found at '{}'".format(args.resume), log)
-
-    cudnn.benchmark = True
-
-    # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, sampler=None)
-
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+    else:
+        print_log("=> do not use any checkpoint for {} model".format(args.arch), log)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, log)
+        time1 = time.time()
+        validate(test_loader, net, criterion, log)
+        time2 = time.time()
+        print('function took %0.3f ms' % ((time2 - time1) * 1000.0))
         return
 
-    filename = os.path.join(args.save_dir, 'checkpoint.{:}.{:}.pth.tar'.format(args.arch, args.prefix))
-    bestname = os.path.join(args.save_dir, 'best.{:}.{:}.pth.tar'.format(args.arch, args.prefix))
+    # Create a copy of the original model for distillation if needed
+    teacher_model = None
+    if args.use_distillation:
+        teacher_model = copy.deepcopy(net)
+        teacher_model.eval()
+        if args.use_cuda:
+            teacher_model.cuda()
+        print_log("Created teacher model for distillation", log)
 
-    m = Mask(model)
+    # Collect activation statistics if needed
+    if args.use_activation_stats:
+        print_log("Collecting activation statistics...", log)
+        collect_activation_stats(net, train_loader, 'cuda' if args.use_cuda else 'cpu')
 
-    m.init_length()
-    print("-" * 10 + "one epoch begin" + "-" * 10)
-    print("the compression rate now is {:}".format(args.rate))
-
-    val_acc_1 = validate(val_loader, model, criterion, log)
-
-    print(">>>>> accu before is: {:}".format(val_acc_1))
-
-    m.model = model
-
-    m.init_mask(args.rate)
-    # m.if_zero()
-    m.do_mask()
-    model = m.model
-    # m.if_zero()
-    if args.use_cuda:
-        model = model.cuda()
-    val_acc_2 = validate(val_loader, model, criterion, log)
-    print(">>>>> accu after is: {:}".format(val_acc_2))
-
+    # Main loop
     start_time = time.time()
     epoch_time = AverageMeter()
     for epoch in range(args.start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
+        # Use cosine annealing learning rate if enabled
+        if args.use_cosine_lr:
+            current_learning_rate = adjust_cosine_learning_rate(optimizer, epoch, args.epochs, args.learning_rate)
+        else:
+            current_learning_rate = adjust_learning_rate(optimizer, epoch, args.gammas, args.schedule)
 
-        need_hour, need_mins, need_secs = convert_secs2time(epoch_time.val * (args.epochs - epoch))
-        need_time = '[Need: {:02d}:{:02d}:{:02d}]'.format(need_hour, need_mins, need_secs)
+        need_hour, need_mins, need_secs = convert_secs2time(epoch_time.avg * (args.epochs - epoch))
         print_log(
-            ' [{:s}] :: {:3d}/{:3d} ----- [{:s}] {:s}'.format(args.arch, epoch, args.epochs, time_string(), need_time),
-            log)
+            '\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:6.4f}]'.format(time_string(), epoch, args.epochs,
+                                                                                   convert_secs2time(
+                                                                                       epoch_time.avg * epoch),
+                                                                                   current_learning_rate) \
+            + ' [Need: {:02d}:{:02d}:{:02d}]'.format(need_hour, need_mins, need_secs), log)
 
-        # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, log)
-        # evaluate on validation set
-        val_acc_1 = validate(val_loader, model, criterion, log)
-        if (epoch % args.epoch_prune == 0 or epoch == args.epochs - 1):
-            #        if (random.randint(1,args.epoch_prune)==1 or epoch == args.epochs-1):
-            m.model = model
-            m.if_zero()
-            m.init_mask(args.rate)
-            m.do_mask()
-            m.if_zero()
-            model = m.model
-            if args.use_cuda:
-                model = model.cuda()
+        # Train and test
+        train_acc, train_los = train(train_loader, net, criterion, optimizer, epoch, log, teacher_model)
+        test_acc, test_los = validate(test_loader, net, criterion, log)
 
-        val_acc_2 = validate(val_loader, model, criterion, log)
+        # Update recorder
+        recorder.update(epoch, train_los, train_acc, test_los, test_acc)
 
-        # remember best prec@1 and save checkpoint
-        is_best = val_acc_2 > best_prec1
-        best_prec1 = max(val_acc_2, best_prec1)
+        # Save model
+        is_best = recorder.max_accuracy(False) == test_acc
         save_checkpoint({
             'epoch': epoch + 1,
             'arch': args.arch,
-            'state_dict': model.state_dict(),
-            'best_prec1': best_prec1,
+            'state_dict': net,
+            'recorder': recorder,
             'optimizer': optimizer.state_dict(),
-        }, is_best, filename, bestname)
-        # measure elapsed time
+        }, is_best, args.save_path, 'checkpoint.pth.tar')
+
+        # Measure elapsed time
         epoch_time.update(time.time() - start_time)
         start_time = time.time()
+        recorder.plot_curve(os.path.join(args.save_path, 'curve.png'))
+
     log.close()
 
 
-def import_sparse(model):
-    checkpoint = torch.load(args.sparse)
-    new_state_dict = OrderedDict()
-    for k, v in checkpoint['state_dict'].items():
-        name = k[7:]  # remove `module.`
-        new_state_dict[name] = v
-    model.load_state_dict(new_state_dict)
-    print("sparse_model_loaded")
-    return model
-
-
-def train(train_loader, model, criterion, optimizer, epoch, log):
+# train function
+def train(train_loader, model, criterion, optimizer, epoch, log, teacher_model=None):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
 
-    # switch to train mode
+    # Switch to train mode
     model.train()
+    
+    # Set teacher model to eval mode if using distillation
+    if teacher_model is not None:
+        teacher_model.eval()
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
-        # measure data loading time
+        # Measure data loading time
         data_time.update(time.time() - end)
 
-        target = target.cuda(async=True)
+        if args.use_cuda:
+            target = target.cuda()
+            input = input.cuda()
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
 
-        # compute output
+        # Compute output
         output = model(input_var)
-        loss = criterion(output, target_var)
+        
+        # Calculate loss (with distillation if enabled)
+        if teacher_model is not None:
+            # Get teacher predictions
+            with torch.no_grad():
+                teacher_output = teacher_model(input_var)
+            
+            # Regular cross-entropy loss
+            ce_loss = criterion(output, target_var)
+            
+            # Distillation loss
+            kd_loss = distillation_loss(output, teacher_output, args.distill_temp)
+            
+            # Combined loss
+            loss = args.distill_alpha * ce_loss + (1 - args.distill_alpha) * kd_loss
+        else:
+            # Regular loss
+            loss = criterion(output, target_var)
 
-        # measure accuracy and record loss
+        # Measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-        top5.update(prec5[0], input.size(0))
+        losses.update(loss.data.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
+        top5.update(prec5.item(), input.size(0))
 
-        # compute gradient and do SGD step
+        # Compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # measure elapsed time
+        # Measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
         if i % args.print_freq == 0:
-            print_log('Epoch: [{0}][{1}/{2}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+            print_log('  Epoch: [{:03d}][{:03d}/{:03d}]   '
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})   '
+                      'Data {data_time.val:.3f} ({data_time.avg:.3f})   '
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})   '
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})   '
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})   '.format(
                 epoch, i, len(train_loader), batch_time=batch_time,
-                data_time=data_time, loss=losses, top1=top1, top5=top5), log)
+                data_time=data_time, loss=losses, top1=top1, top5=top5) + time_string(), log)
+    
+    print_log('  **Train** Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Error@1 {error1:.3f}'.format(
+        top1=top1, top5=top5, error1=100-top1.avg), log)
+    
+    # Apply pruning if needed
+    if epoch % args.epoch_prune == 0:
+        print_log('Pruning filters for epoch {}'.format(epoch), log)
+        
+        # Apply adaptive pruning rate if enabled
+        if args.use_adaptive_rate:
+            for layer_idx in range(args.layer_begin, args.layer_end + 1, args.layer_inter):
+                # Get adaptive rate based on layer position
+                if layer_idx <= 18:  # First stage
+                    adaptive_rate = args.rate + 0.1  # Prune less (keep more filters)
+                elif layer_idx >= 37:  # Last stage
+                    adaptive_rate = args.rate + 0.05  # Prune slightly less
+                else:  # Middle stage
+                    adaptive_rate = args.rate  # Standard pruning rate
+                
+                # Apply progressive pruning if enabled
+                if args.use_progressive_pruning:
+                    if epoch < args.warmup_epochs:
+                        # No pruning during warmup
+                        current_rate = 1.0
+                    else:
+                        # Gradually increase pruning (decrease keep rate)
+                        current_rate = 1.0 - (1.0 - adaptive_rate) * min(1.0, (epoch - args.warmup_epochs) / (args.epochs * 0.6))
+                else:
+                    current_rate = adaptive_rate
+                
+                print_log('Layer index: {:d}, pruning rate: {:.2f}'.format(layer_idx, current_rate), log)
+                mask = mask_model(model, layer_idx, current_rate)
+                model = apply_mask(model, layer_idx, mask)
+        else:
+            # Original pruning logic
+            for layer_idx in range(args.layer_begin, args.layer_end + 1, args.layer_inter):
+                mask = mask_model(model, layer_idx, args.rate)
+                model = apply_mask(model, layer_idx, mask)
+    
+    # Update batch normalization statistics after pruning if needed
+    if epoch % args.epoch_prune == 0 and epoch > 0:
+        print_log('Updating batch normalization statistics...', log)
+        update_bn_stats(model, train_loader, 'cuda' if args.use_cuda else 'cpu')
+    
+    return top1.avg, losses.avg
 
 
 def validate(val_loader, model, criterion, log):
-    batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
 
-    # switch to evaluate mode
+    # Switch to evaluate mode
     model.eval()
 
-    end = time.time()
-    for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
+    with torch.no_grad():
+        for i, (input, target) in enumerate(val_loader):
+            if args.use_cuda:
+                target = target.cuda()
+                input = input.cuda()
+            
+            # Compute output
+            output = model(input)
+            loss = criterion(output, target)
 
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+            # Measure accuracy and record loss
+            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+            losses.update(loss.data.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
+            top5.update(prec5.item(), input.size(0))
 
-        # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-        top5.update(prec5[0], input.size(0))
+    print_log('  **Test** Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Error@1 {error1:.3f}'.format(
+        top1=top1, top5=top5, error1=100-top1.avg), log)
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if i % args.print_freq == 0:
-            print_log('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                i, len(val_loader), batch_time=batch_time, loss=losses,
-                top1=top1, top5=top5), log)
-
-    print_log(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Error@1 {error1:.3f}'.format(top1=top1, top5=top5,
-                                                                                           error1=100 - top1.avg), log)
-
-    return top1.avg
-
-
-def save_checkpoint(state, is_best, filename, bestname):
-    torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, bestname)
+    return top1.avg, losses.avg
 
 
 def print_log(print_string, log):
-    print("{:}".format(print_string))
-    log.write('{:}\n'.format(print_string))
+    print("{}".format(print_string))
+    log.write('{}\n'.format(print_string))
     log.flush()
 
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+def save_checkpoint(state, is_best, save_path, filename):
+    filename = os.path.join(save_path, filename)
+    torch.save(state, filename)
+    if is_best:
+        bestname = os.path.join(save_path, 'model_best.pth.tar')
+        shutil.copyfile(filename, bestname)
 
 
-def adjust_learning_rate(optimizer, epoch):
+def adjust_learning_rate(optimizer, epoch, gammas, schedule):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.1 ** (epoch // args.lr_adjust))
+    lr = args.learning_rate
+    assert len(gammas) == len(schedule), "length of gammas and schedule should be equal"
+    for (gamma, step) in zip(gammas, schedule):
+        if (epoch >= step):
+            lr = lr * gamma
+        else:
+            break
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+    return lr
+
+
+def adjust_cosine_learning_rate(optimizer, epoch, max_epochs, initial_lr):
+    """Cosine annealing learning rate scheduler"""
+    lr = initial_lr * 0.5 * (1 + math.cos(math.pi * epoch / max_epochs))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
 
 
 def accuracy(output, target, topk=(1,)):
@@ -380,151 +456,294 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+        correct_k = correct[:k].reshape(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
 
-class Mask:
-    def __init__(self, model):
-        self.model_size = {}
-        self.model_length = {}
-        self.compress_rate = {}
-        self.mat = {}
-        self.model = model
-        self.mask_index = []
+def mask_model(model, layer_idx, prune_ratio):
+    """
+    Generate mask for pruning
+    
+    Args:
+        model: The model
+        layer_idx: Layer index
+        prune_ratio: Pruning ratio
+        
+    Returns:
+        Mask for pruning
+    """
+    # Find the layer
+    layer = None
+    if layer_idx == 1:
+        layer = model.module.conv_1_3x3
+    elif layer_idx == 2:
+        layer = model.module.stage_1[0].conv_a
+    elif layer_idx == 3:
+        layer = model.module.stage_1[0].conv_b
+    elif layer_idx == 4:
+        layer = model.module.stage_1[1].conv_a
+    elif layer_idx == 5:
+        layer = model.module.stage_1[1].conv_b
+    elif layer_idx == 6:
+        layer = model.module.stage_1[2].conv_a
+    elif layer_idx == 7:
+        layer = model.module.stage_1[2].conv_b
+    elif layer_idx == 8:
+        layer = model.module.stage_1[3].conv_a
+    elif layer_idx == 9:
+        layer = model.module.stage_1[3].conv_b
+    elif layer_idx == 10:
+        layer = model.module.stage_1[4].conv_a
+    elif layer_idx == 11:
+        layer = model.module.stage_1[4].conv_b
+    elif layer_idx == 12:
+        layer = model.module.stage_1[5].conv_a
+    elif layer_idx == 13:
+        layer = model.module.stage_1[5].conv_b
+    elif layer_idx == 14:
+        layer = model.module.stage_1[6].conv_a
+    elif layer_idx == 15:
+        layer = model.module.stage_1[6].conv_b
+    elif layer_idx == 16:
+        layer = model.module.stage_1[7].conv_a
+    elif layer_idx == 17:
+        layer = model.module.stage_1[7].conv_b
+    elif layer_idx == 18:
+        layer = model.module.stage_1[8].conv_a
+    elif layer_idx == 19:
+        layer = model.module.stage_1[8].conv_b
+    elif layer_idx == 20:
+        layer = model.module.stage_2[0].conv_a
+    elif layer_idx == 21:
+        layer = model.module.stage_2[0].conv_b
+    elif layer_idx == 22:
+        layer = model.module.stage_2[1].conv_a
+    elif layer_idx == 23:
+        layer = model.module.stage_2[1].conv_b
+    elif layer_idx == 24:
+        layer = model.module.stage_2[2].conv_a
+    elif layer_idx == 25:
+        layer = model.module.stage_2[2].conv_b
+    elif layer_idx == 26:
+        layer = model.module.stage_2[3].conv_a
+    elif layer_idx == 27:
+        layer = model.module.stage_2[3].conv_b
+    elif layer_idx == 28:
+        layer = model.module.stage_2[4].conv_a
+    elif layer_idx == 29:
+        layer = model.module.stage_2[4].conv_b
+    elif layer_idx == 30:
+        layer = model.module.stage_2[5].conv_a
+    elif layer_idx == 31:
+        layer = model.module.stage_2[5].conv_b
+    elif layer_idx == 32:
+        layer = model.module.stage_2[6].conv_a
+    elif layer_idx == 33:
+        layer = model.module.stage_2[6].conv_b
+    elif layer_idx == 34:
+        layer = model.module.stage_2[7].conv_a
+    elif layer_idx == 35:
+        layer = model.module.stage_2[7].conv_b
+    elif layer_idx == 36:
+        layer = model.module.stage_2[8].conv_a
+    elif layer_idx == 37:
+        layer = model.module.stage_2[8].conv_b
+    elif layer_idx == 38:
+        layer = model.module.stage_3[0].conv_a
+    elif layer_idx == 39:
+        layer = model.module.stage_3[0].conv_b
+    elif layer_idx == 40:
+        layer = model.module.stage_3[1].conv_a
+    elif layer_idx == 41:
+        layer = model.module.stage_3[1].conv_b
+    elif layer_idx == 42:
+        layer = model.module.stage_3[2].conv_a
+    elif layer_idx == 43:
+        layer = model.module.stage_3[2].conv_b
+    elif layer_idx == 44:
+        layer = model.module.stage_3[3].conv_a
+    elif layer_idx == 45:
+        layer = model.module.stage_3[3].conv_b
+    elif layer_idx == 46:
+        layer = model.module.stage_3[4].conv_a
+    elif layer_idx == 47:
+        layer = model.module.stage_3[4].conv_b
+    elif layer_idx == 48:
+        layer = model.module.stage_3[5].conv_a
+    elif layer_idx == 49:
+        layer = model.module.stage_3[5].conv_b
+    elif layer_idx == 50:
+        layer = model.module.stage_3[6].conv_a
+    elif layer_idx == 51:
+        layer = model.module.stage_3[6].conv_b
+    elif layer_idx == 52:
+        layer = model.module.stage_3[7].conv_a
+    elif layer_idx == 53:
+        layer = model.module.stage_3[7].conv_b
+    elif layer_idx == 54:
+        layer = model.module.stage_3[8].conv_a
+    elif layer_idx == 55:
+        layer = model.module.stage_3[8].conv_b
+    
+    if layer is None:
+        return None
+    
+    # Get the weights
+    weight = layer.weight.data
+    
+    # Use the enhanced filter importance function
+    if args.use_activation_stats and hasattr(layer, 'activation_stats'):
+        importance = get_filter_importance(weight, layer.activation_stats)
+    else:
+        # Calculate L1-norm
+        importance = get_filter_importance(weight)
+    
+    # Sort and get threshold
+    sorted_importance, sorted_idx = torch.sort(importance)
+    threshold = sorted_importance[int(prune_ratio * len(sorted_importance))]
+    
+    # Create mask
+    mask = torch.gt(importance, threshold).float()
+    
+    return mask
 
-    def get_codebook(self, weight_torch, compress_rate, length):
-        weight_vec = weight_torch.view(length)
-        weight_np = weight_vec.cpu().numpy()
 
-        weight_abs = np.abs(weight_np)
-        weight_sort = np.sort(weight_abs)
-
-        threshold = weight_sort[int(length * (1 - compress_rate))]
-        weight_np[weight_np <= -threshold] = 1
-        weight_np[weight_np >= threshold] = 1
-        weight_np[weight_np != 1] = 0
-
-        print("codebook done")
-        return weight_np
-
-    def get_filter_codebook(self, weight_torch, compress_rate, length):
-        codebook = np.ones(length)
-        if len(weight_torch.size()) == 4:
-            filter_pruned_num = int(weight_torch.size()[0] * (1 - compress_rate))
-            weight_vec = weight_torch.view(weight_torch.size()[0], -1)
-            # norm1 = torch.norm(weight_vec, 1, 1)
-            # norm1_np = norm1.cpu().numpy()
-            norm2 = torch.norm(weight_vec, 2, 1)
-            norm2_np = norm2.cpu().numpy()
-            filter_index = norm2_np.argsort()[:filter_pruned_num]
-            #            norm1_sort = np.sort(norm1_np)
-            #            threshold = norm1_sort[int (weight_torch.size()[0] * (1-compress_rate) )]
-            kernel_length = weight_torch.size()[1] * weight_torch.size()[2] * weight_torch.size()[3]
-            for x in range(0, len(filter_index)):
-                codebook[filter_index[x] * kernel_length: (filter_index[x] + 1) * kernel_length] = 0
-
-            print("filter codebook done")
-        else:
-            pass
-        return codebook
-
-    def convert2tensor(self, x):
-        x = torch.FloatTensor(x)
-        return x
-
-    def init_length(self):
-        for index, item in enumerate(self.model.parameters()):
-            self.model_size[index] = item.size()
-
-        for index1 in self.model_size:
-            for index2 in range(0, len(self.model_size[index1])):
-                if index2 == 0:
-                    self.model_length[index1] = self.model_size[index1][0]
-                else:
-                    self.model_length[index1] *= self.model_size[index1][index2]
-
-    def init_rate(self, layer_rate):
-        if 'vgg' in args.arch:
-            cfg_5x = [24, 22, 41, 51, 108, 89, 111, 184, 276, 228, 512, 512, 512]
-            cfg_official = [64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512]
-            # cfg = [32, 64, 128, 128, 256, 256, 256, 256, 256, 256, 256, 256, 256]
-            cfg_index = 0
-            pre_cfg = True
-            for index, item in enumerate(self.model.named_parameters()):
-                self.compress_rate[index] = 1
-                if len(item[1].size()) == 4:
-                    print(item[1].size())
-                    if not pre_cfg:
-                        self.compress_rate[index] = layer_rate
-                        self.mask_index.append(index)
-                        print(item[0], "self.mask_index", self.mask_index)
-                    else:
-                        self.compress_rate[index] =  1 - cfg_5x[cfg_index] / item[1].size()[0]
-                        self.mask_index.append(index)
-                        print(item[0], "self.mask_index", self.mask_index, cfg_index, cfg_5x[cfg_index], item[1].size()[0],
-                               )
-                        cfg_index += 1
-        elif "resnet" in args.arch:
-            for index, item in enumerate(self.model.parameters()):
-                self.compress_rate[index] = 1
-            for key in range(args.layer_begin, args.layer_end + 1, args.layer_inter):
-                self.compress_rate[key] = layer_rate
-            if args.arch == 'resnet18':
-                # last index include last fc layer
-                last_index = 60
-                skip_list = [21, 36, 51]
-            elif args.arch == 'resnet34':
-                last_index = 108
-                skip_list = [27, 54, 93]
-            elif args.arch == 'resnet50':
-                last_index = 159
-                skip_list = [12, 42, 81, 138]
-            elif args.arch == 'resnet101':
-                last_index = 312
-                skip_list = [12, 42, 81, 291]
-            elif args.arch == 'resnet152':
-                last_index = 465
-                skip_list = [12, 42, 117, 444]
-            self.mask_index = [x for x in range(0, last_index, 3)]
-            # skip downsample layer
-            if args.skip_downsample == 1:
-                for x in skip_list:
-                    self.compress_rate[x] = 1
-                    self.mask_index.remove(x)
-                    print(self.mask_index)
-            else:
-                pass
-
-    def init_mask(self, layer_rate):
-        self.init_rate(layer_rate)
-        for index, item in enumerate(self.model.parameters()):
-            if (index in self.mask_index):
-                self.mat[index] = self.get_filter_codebook(item.data, self.compress_rate[index],
-                                                           self.model_length[index])
-                self.mat[index] = self.convert2tensor(self.mat[index])
-                if args.use_cuda:
-                    self.mat[index] = self.mat[index].cuda()
-        print("mask Ready")
-
-    def do_mask(self):
-        for index, item in enumerate(self.model.parameters()):
-            if (index in self.mask_index):
-                a = item.data.view(self.model_length[index])
-                b = a * self.mat[index]
-                item.data = b.view(self.model_size[index])
-        print("mask Done")
-
-    def if_zero(self):
-        for index, item in enumerate(self.model.parameters()):
-            #            if(index in self.mask_index):
-            if index in [x for x in range(args.layer_begin, args.layer_end + 1, args.layer_inter)]:
-                a = item.data.view(self.model_length[index])
-                b = a.cpu().numpy()
-
-                print("layer: %d, number of nonzero weight is %d, zero is %d" % (
-                    index, np.count_nonzero(b), len(b) - np.count_nonzero(b)))
+def apply_mask(model, layer_idx, mask):
+    """
+    Apply mask to the model
+    
+    Args:
+        model: The model
+        layer_idx: Layer index
+        mask: Mask for pruning
+        
+    Returns:
+        Pruned model
+    """
+    if mask is None:
+        return model
+    
+    # Find the layer
+    layer = None
+    if layer_idx == 1:
+        layer = model.module.conv_1_3x3
+    elif layer_idx == 2:
+        layer = model.module.stage_1[0].conv_a
+    elif layer_idx == 3:
+        layer = model.module.stage_1[0].conv_b
+    elif layer_idx == 4:
+        layer = model.module.stage_1[1].conv_a
+    elif layer_idx == 5:
+        layer = model.module.stage_1[1].conv_b
+    elif layer_idx == 6:
+        layer = model.module.stage_1[2].conv_a
+    elif layer_idx == 7:
+        layer = model.module.stage_1[2].conv_b
+    elif layer_idx == 8:
+        layer = model.module.stage_1[3].conv_a
+    elif layer_idx == 9:
+        layer = model.module.stage_1[3].conv_b
+    elif layer_idx == 10:
+        layer = model.module.stage_1[4].conv_a
+    elif layer_idx == 11:
+        layer = model.module.stage_1[4].conv_b
+    elif layer_idx == 12:
+        layer = model.module.stage_1[5].conv_a
+    elif layer_idx == 13:
+        layer = model.module.stage_1[5].conv_b
+    elif layer_idx == 14:
+        layer = model.module.stage_1[6].conv_a
+    elif layer_idx == 15:
+        layer = model.module.stage_1[6].conv_b
+    elif layer_idx == 16:
+        layer = model.module.stage_1[7].conv_a
+    elif layer_idx == 17:
+        layer = model.module.stage_1[7].conv_b
+    elif layer_idx == 18:
+        layer = model.module.stage_1[8].conv_a
+    elif layer_idx == 19:
+        layer = model.module.stage_1[8].conv_b
+    elif layer_idx == 20:
+        layer = model.module.stage_2[0].conv_a
+    elif layer_idx == 21:
+        layer = model.module.stage_2[0].conv_b
+    elif layer_idx == 22:
+        layer = model.module.stage_2[1].conv_a
+    elif layer_idx == 23:
+        layer = model.module.stage_2[1].conv_b
+    elif layer_idx == 24:
+        layer = model.module.stage_2[2].conv_a
+    elif layer_idx == 25:
+        layer = model.module.stage_2[2].conv_b
+    elif layer_idx == 26:
+        layer = model.module.stage_2[3].conv_a
+    elif layer_idx == 27:
+        layer = model.module.stage_2[3].conv_b
+    elif layer_idx == 28:
+        layer = model.module.stage_2[4].conv_a
+    elif layer_idx == 29:
+        layer = model.module.stage_2[4].conv_b
+    elif layer_idx == 30:
+        layer = model.module.stage_2[5].conv_a
+    elif layer_idx == 31:
+        layer = model.module.stage_2[5].conv_b
+    elif layer_idx == 32:
+        layer = model.module.stage_2[6].conv_a
+    elif layer_idx == 33:
+        layer = model.module.stage_2[6].conv_b
+    elif layer_idx == 34:
+        layer = model.module.stage_2[7].conv_a
+    elif layer_idx == 35:
+        layer = model.module.stage_2[7].conv_b
+    elif layer_idx == 36:
+        layer = model.module.stage_2[8].conv_a
+    elif layer_idx == 37:
+        layer = model.module.stage_2[8].conv_b
+    elif layer_idx == 38:
+        layer = model.module.stage_3[0].conv_a
+    elif layer_idx == 39:
+        layer = model.module.stage_3[0].conv_b
+    elif layer_idx == 40:
+        layer = model.module.stage_3[1].conv_a
+    elif layer_idx == 41:
+        layer = model.module.stage_3[1].conv_b
+    elif layer_idx == 42:
+        layer = model.module.stage_3[2].conv_a
+    elif layer_idx == 43:
+        layer = model.module.stage_3[2].conv_b
+    elif layer_idx == 44:
+        layer = model.module.stage_3[3].conv_a
+    elif layer_idx == 45:
+        layer = model.module.stage_3[3].conv_b
+    elif layer_idx == 46:
+        layer = model.module.stage_3[4].conv_a
+    elif layer_idx == 47:
+        layer = model.module.stage_3[4].conv_b
+    elif layer_idx == 48:
+        layer = model.module.stage_3[5].conv_a
+    elif layer_idx == 49:
+        layer = model.module.stage_3[5].conv_b
+    elif layer_idx == 50:
+        layer = model.module.stage_3[6].conv_a
+    elif layer_idx == 51:
+        layer = model.module.stage_3[6].conv_b
+    elif layer_idx == 52:
+        layer = model.module.stage_3[7].conv_a
+    elif layer_idx == 53:
+        layer = model.module.stage_3[7].conv_b
+    elif layer_idx == 54:
+        layer = model.module.stage_3[8].conv_a
+    elif layer_idx == 55:
+        layer = model.module.stage_3[8].conv_b
+    
+    if layer is None:
+        return model
+    
+    # Apply mask
+    layer.weight.data = layer.weight.data * mask.view(-1, 1, 1, 1)
+    
+    return model
 
 
 if __name__ == '__main__':
